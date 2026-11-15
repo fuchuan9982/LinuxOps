@@ -1,4 +1,4 @@
 group,name,host,port,user
-生产环境,web-01,192.0.2.10,22,root
-生产环境,db-01,192.0.2.11,22,ops
-测试环境,test-01,192.0.2.20,22,root
+Ubuntu生产,web-01,192.0.2.10,22,ubuntu
+Rocky测试,db-01,192.0.2.20,22,rocky
+Debian测试,cache-01,192.0.2.30,22,debian

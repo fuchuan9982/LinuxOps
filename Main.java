@@ -1,334 +1,269 @@
 package com.linuxops;
 
-import net.schmizz.sshj.SSHClient;
-import net.schmizz.sshj.connection.channel.direct.Session;
-import net.schmizz.sshj.sftp.SFTPClient;
+import com.linuxops.inspection.InspectionReport;
+import com.linuxops.inspection.InspectionService;
+import com.linuxops.inspection.Severity;
+import com.linuxops.model.Host;
+import com.linuxops.report.ReportExporter;
+import com.linuxops.ssh.SshOperations;
+import com.linuxops.task.TaskManager;
+import com.linuxops.task.TaskResult;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import javax.swing.table.DefaultTableModel;
 import java.awt.*;
-import java.io.*;
+import java.io.BufferedReader;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.*;
 import java.util.List;
-import java.util.concurrent.*;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ConcurrentHashMap;
 
-public class Main {
-    private static final Color BG = new Color(18, 24, 33), PANEL = new Color(27, 36, 48),
-            FIELD = new Color(13, 19, 27), TEXT = new Color(225, 233, 242),
-            MUTED = new Color(145, 160, 178), ACCENT = new Color(35, 145, 220);
-    private final DefaultTableModel model = new DefaultTableModel(
-            new Object[]{"选择", "分组", "名称", "主机/IP", "端口", "用户名", "认证"}, 0) {
-        public boolean isCellEditable(int r, int c) { return c == 0; }
-        public Class<?> getColumnClass(int c) { return c == 0 ? Boolean.class : String.class; }
+/** Swing entry point integrated with structured inspection and bounded batch execution. */
+public final class Main {
+    private final DefaultTableModel tableModel = new DefaultTableModel(
+            new Object[]{"选择", "分组", "名称", "主机/IP", "端口", "用户", "最近巡检"}, 0) {
+        @Override public boolean isCellEditable(int r, int c) { return c == 0; }
+        @Override public Class<?> getColumnClass(int c) { return c == 0 ? Boolean.class : String.class; }
     };
-    private final JTable table = new JTable(model);
-    private final JTextArea output = new JTextArea();
-    private final JTextField command = new JTextField("uptime && free -h && df -h");
-    private final ThreadPoolExecutor pool = new ThreadPoolExecutor(8, 30, 60, TimeUnit.SECONDS, new ArrayBlockingQueue<>(1000), new ThreadPoolExecutor.CallerRunsPolicy());
-    private final ScheduledExecutorService monitor = Executors.newSingleThreadScheduledExecutor();
-    private final AtomicBoolean monitoring = new AtomicBoolean(false);
-    private ScheduledFuture<?> monitorTask;
+    private final JTable table = new JTable(tableModel);
+    private final JTextArea log = new JTextArea();
+    private final JPasswordField password = new JPasswordField(16);
+    private final JLabel status = new JLabel("就绪");
     private final List<Host> hosts = new ArrayList<>();
-    private final JLabel status = new JLabel("就绪 | 支持批量 SSH / SFTP");
-    private final JPasswordField password = new JPasswordField(14);
+    private final Map<String, InspectionReport> reports = new ConcurrentHashMap<>();
+    private final TaskManager taskManager = new TaskManager(12, 600, 50);
+    private final InspectionService inspectionService = new InspectionService(taskManager);
+    private final SshOperations sshOperations = new SshOperations(taskManager);
+    private TaskManager.BatchHandle activeBatch;
 
     public static void main(String[] args) {
         SwingUtilities.invokeLater(() -> new Main().show());
     }
 
     private void show() {
-        try { UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName()); } catch (Exception ignored) {}
-        JFrame frame = new JFrame("LinuxOps · 批量 SSH 运维平台");
-        frame.setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE);
-        frame.setMinimumSize(new Dimension(1080, 720));
-        frame.setSize(1280, 820);
-        frame.setLocationRelativeTo(null);
-        JPanel root = new JPanel(new BorderLayout(12, 12));
-        root.setBackground(BG); root.setBorder(new EmptyBorder(16, 16, 12, 16));
+        try { UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName()); } catch (Exception ignored) { }
+        JFrame frame = new JFrame("LinuxOps Professional · Linux 批量运维平台");
+        frame.setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
+        frame.addWindowListener(new java.awt.event.WindowAdapter() {
+            @Override public void windowClosing(java.awt.event.WindowEvent e) { taskManager.close(); frame.dispose(); }
+        });
+        frame.setMinimumSize(new Dimension(1050, 680)); frame.setSize(1240, 800); frame.setLocationRelativeTo(null);
+        JPanel root = new JPanel(new BorderLayout(10, 10)); root.setBorder(new EmptyBorder(14,14,10,14));
         root.add(header(), BorderLayout.NORTH);
-        root.add(center(), BorderLayout.CENTER);
-        root.add(footer(), BorderLayout.SOUTH);
-        frame.setContentPane(root);
-        frame.setVisible(true);
-        append("LinuxOps 已启动。请先导入服务器 CSV，或手动添加服务器。");
+        JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, hostPanel(), operationPanel());
+        split.setResizeWeight(.43); root.add(split, BorderLayout.CENTER);
+        JPanel foot = new JPanel(new BorderLayout()); foot.add(status, BorderLayout.WEST);
+        foot.add(new JLabel(" SSH known_hosts 校验开启 · 建议使用 SSH 密钥认证"), BorderLayout.EAST); root.add(foot, BorderLayout.SOUTH);
+        frame.setContentPane(root); frame.setVisible(true); append("LinuxOps Professional 已启动。请导入或添加服务器。");
     }
 
     private JPanel header() {
-        JPanel p = new JPanel(new BorderLayout()); p.setOpaque(false);
-        JPanel title = new JPanel(new GridLayout(2,1)); title.setOpaque(false);
-        JLabel h = new JLabel("LINUXOPS  /  批量服务器运维"); h.setForeground(TEXT); h.setFont(new Font("Microsoft YaHei UI", Font.BOLD, 23));
-        JLabel sub = new JLabel("集中连接 · 批量执行 · 文件传输 · 巡检"); sub.setForeground(MUTED);
-        title.add(h); title.add(sub); p.add(title, BorderLayout.WEST);
-        JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 4)); actions.setOpaque(false);
-        actions.add(button("导入 CSV", this::importCsv)); actions.add(button("添加服务器", this::addHost));
-        actions.add(button("删除选中", this::deleteSelected)); p.add(actions, BorderLayout.EAST);
+        JPanel p = new JPanel(new BorderLayout());
+        JLabel title = new JLabel("LINUXOPS PROFESSIONAL  /  批量 Linux 运维"); title.setFont(new Font("Microsoft YaHei UI", Font.BOLD, 22));
+        p.add(title, BorderLayout.WEST);
+        JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
+        actions.add(new JButton(new AbstractAction("导入 CSV") { public void actionPerformed(java.awt.event.ActionEvent e) { importCsv(); }}));
+        actions.add(new JButton(new AbstractAction("添加服务器") { public void actionPerformed(java.awt.event.ActionEvent e) { addHost(); }}));
+        actions.add(new JButton(new AbstractAction("删除选中") { public void actionPerformed(java.awt.event.ActionEvent e) { deleteSelected(); }}));
+        p.add(actions, BorderLayout.EAST); return p;
+    }
+
+    private JPanel hostPanel() {
+        JPanel p = new JPanel(new BorderLayout(6,6)); p.setBorder(BorderFactory.createTitledBorder("服务器清单"));
+        table.setRowHeight(27); p.add(new JScrollPane(table), BorderLayout.CENTER);
+        JPanel cred = new JPanel(new FlowLayout(FlowLayout.LEFT)); cred.add(new JLabel("SSH 密码（留空使用密钥）")); cred.add(password); p.add(cred, BorderLayout.SOUTH); return p;
+    }
+
+    private JPanel operationPanel() {
+        JPanel p = new JPanel(new BorderLayout(8,8)); p.setBorder(BorderFactory.createTitledBorder("任务中心 / 巡检结果"));
+        JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT,6,4));
+        actions.add(button("开始批量巡检", this::inspect));
+        actions.add(button("执行 SSH 命令", this::runCommand));
+        actions.add(button("批量安装软件", this::installPackages));
+        actions.add(button("systemd 服务", this::manageService));
+        actions.add(button("上传文件", this::uploadFile));
+        actions.add(button("下载文件", this::downloadFile));
+        actions.add(button("批量重启", this::rebootHosts));
+        actions.add(button("取消当前批次", this::cancelBatch));
+        actions.add(button("导出 HTML", () -> export(true))); actions.add(button("导出 CSV", () -> export(false)));
+        p.add(new JScrollPane(actions), BorderLayout.NORTH);
+        log.setEditable(false); log.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12)); p.add(new JScrollPane(log), BorderLayout.CENTER);
         return p;
     }
 
-    private JSplitPane center() {
-        JPanel left = panel("服务器列表", new BorderLayout(8,8));
-        table.setRowHeight(30); table.setBackground(PANEL); table.setForeground(TEXT);
-        table.setGridColor(new Color(48,60,74)); table.setSelectionBackground(new Color(35,75,105));
-        table.getTableHeader().setBackground(new Color(35,48,63)); table.getTableHeader().setForeground(TEXT);
-        left.add(new JScrollPane(table), BorderLayout.CENTER);
-        JPanel credential = new JPanel(new FlowLayout(FlowLayout.LEFT)); credential.setOpaque(false);
-        credential.add(label("SSH 密码（本次操作使用）")); styleField(password); credential.add(password);
-        left.add(credential, BorderLayout.SOUTH);
-
-        JPanel right = panel("命令执行 / 操作输出", new BorderLayout(8,8));
-        JPanel cmd = new JPanel(new BorderLayout(8,0)); cmd.setOpaque(false);
-        styleField(command); cmd.add(command, BorderLayout.CENTER);
-        cmd.add(button("对选中服务器执行", this::runCommand), BorderLayout.EAST);
-        right.add(cmd, BorderLayout.NORTH);
-        output.setEditable(false); output.setBackground(FIELD); output.setForeground(new Color(195,218,232));
-        output.setCaretColor(TEXT); output.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 13));
-        output.setBorder(new EmptyBorder(10,10,10,10));
-        right.add(new JScrollPane(output), BorderLayout.CENTER);
-        JPanel ops = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0)); ops.setOpaque(false);
-        ops.add(button("批量巡检", this::inspect)); ops.add(button("实时监控：启动/停止", this::toggleMonitor));
-        ops.add(button("导出巡检报告", this::exportReport)); ops.add(button("APT/DNF 安装", this::installPackages));
-        ops.add(button("服务管理", this::manageService)); ops.add(button("上传文件", this::upload));
-        ops.add(button("下载文件", this::download)); ops.add(button("批量重启", this::reboot));
-        right.add(ops, BorderLayout.SOUTH);
-        JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, left, right);
-        split.setResizeWeight(.43); split.setBorder(null); split.setOpaque(false);
-        return split;
-    }
-
-    private JPanel footer() {
-        JPanel p = new JPanel(new BorderLayout()); p.setOpaque(false);
-        status.setForeground(MUTED); p.add(status, BorderLayout.WEST);
-        JLabel note = new JLabel("安全提示：首次连接请核验服务器主机密钥；生产环境建议使用 SSH 密钥认证。");
-        note.setForeground(MUTED); p.add(note, BorderLayout.EAST); return p;
-    }
-
-    private JPanel panel(String title, LayoutManager layout) {
-        JPanel p = new JPanel(layout); p.setBackground(PANEL);
-        p.setBorder(BorderFactory.createCompoundBorder(BorderFactory.createLineBorder(new Color(48,60,74)),
-                BorderFactory.createTitledBorder(BorderFactory.createEmptyBorder(8,8,8,8), title,
-                        0, 0, new Font("Microsoft YaHei UI", Font.BOLD, 14), TEXT)));
-        return p;
-    }
-    private JLabel label(String s) { JLabel l = new JLabel(s); l.setForeground(MUTED); return l; }
-    private JButton button(String text, Runnable action) {
-        JButton b = new JButton(text); b.setFocusPainted(false); b.setForeground(Color.WHITE);
-        b.setBackground(ACCENT); b.setBorder(new EmptyBorder(8,14,8,14));
-        b.addActionListener(e -> action.run()); return b;
-    }
-    private void styleField(JTextField f) { f.setBackground(FIELD); f.setForeground(TEXT); f.setCaretColor(TEXT); f.setBorder(new EmptyBorder(8,8,8,8)); }
+    private JButton button(String label, Runnable action) { JButton b = new JButton(label); b.addActionListener(e -> action.run()); return b; }
 
     private void addHost() {
-        JTextField group = new JTextField("默认", 10), name = new JTextField(12), host = new JTextField(16),
-                port = new JTextField("22",5), user = new JTextField("root",10);
+        JTextField group = new JTextField("默认"), name = new JTextField(), host = new JTextField(), port = new JTextField("22"), user = new JTextField("root");
         JPanel form = new JPanel(new GridLayout(0,2,6,6));
-        for (JComponent c : new JComponent[]{new JLabel("分组"),group,new JLabel("名称"),name,new JLabel("主机/IP"),host,
-                new JLabel("端口"),port,new JLabel("用户名"),user}) form.add(c);
+        for (JComponent c : new JComponent[]{new JLabel("分组"),group,new JLabel("名称"),name,new JLabel("主机/IP"),host,new JLabel("端口"),port,new JLabel("用户名"),user}) form.add(c);
         if (JOptionPane.showConfirmDialog(null, form, "添加服务器", JOptionPane.OK_CANCEL_OPTION) != JOptionPane.OK_OPTION) return;
-        try {
-            Host h = new Host(group.getText(), name.getText(), host.getText(), Integer.parseInt(port.getText()), user.getText());
-            hosts.add(h); model.addRow(new Object[]{true,h.group,h.name,h.host,h.port,h.user,"密码/密钥"});
-        } catch (Exception ex) { error("端口格式不正确"); }
+        try { addHost(new Host(group.getText(),name.getText(),host.getText(),Integer.parseInt(port.getText()),user.getText())); }
+        catch (Exception ex) { warn("服务器信息无效：" + ex.getMessage()); }
+    }
+
+    private void addHost(Host h) {
+        if (hosts.stream().anyMatch(x -> x.id().equalsIgnoreCase(h.id()))) { warn("服务器已存在：" + h.id()); return; }
+        hosts.add(h); tableModel.addRow(new Object[]{true,h.group(),h.name(),h.host(),String.valueOf(h.port()),h.user(),"未巡检"});
     }
 
     private void importCsv() {
-        JFileChooser chooser = new JFileChooser();
-        if (chooser.showOpenDialog(null) != JFileChooser.APPROVE_OPTION) return;
-        try (BufferedReader br = Files.newBufferedReader(chooser.getSelectedFile().toPath(), StandardCharsets.UTF_8)) {
-            String line; int count=0;
-            while ((line=br.readLine()) != null) {
-                if (line.isBlank() || line.startsWith("#") || line.toLowerCase().startsWith("group,")) continue;
-                String[] a=line.split(",",-1); if (a.length < 5) continue;
-                Host h=new Host(a[0].trim(),a[1].trim(),a[2].trim(),Integer.parseInt(a[3].trim()),a[4].trim());
-                hosts.add(h); model.addRow(new Object[]{true,h.group,h.name,h.host,h.port,h.user,"密码/密钥"}); count++;
+        JFileChooser chooser = new JFileChooser(); if (chooser.showOpenDialog(null) != JFileChooser.APPROVE_OPTION) return;
+        int count = 0;
+        try (BufferedReader reader = Files.newBufferedReader(chooser.getSelectedFile().toPath(), StandardCharsets.UTF_8)) {
+            String line; while ((line = reader.readLine()) != null) {
+                if (line.isBlank() || line.startsWith("#") || line.toLowerCase(Locale.ROOT).startsWith("group,")) continue;
+                String[] a = line.split(",", -1); if (a.length < 5) continue;
+                int before = hosts.size(); addHost(new Host(a[0].trim(),a[1].trim(),a[2].trim(),Integer.parseInt(a[3].trim()),a[4].trim()));
+                if (hosts.size() > before) count++;
             }
-            append("CSV 导入完成：" + count + " 台服务器");
-        } catch(Exception ex) { error("导入失败：" + ex.getMessage()); }
+            append("CSV 导入完成：新增 " + count + " 台服务器（格式：group,name,host,port,user；不支持带引号逗号字段）");
+        } catch (Exception ex) { warn("CSV 导入失败：" + ex.getMessage()); }
     }
 
     private void deleteSelected() {
-        for(int i=model.getRowCount()-1;i>=0;i--) if(Boolean.TRUE.equals(model.getValueAt(i,0))) {
-            String host=(String)model.getValueAt(i,3);
-            hosts.removeIf(h->h.host.equals(host)); model.removeRow(i);
+        for (int i = tableModel.getRowCount()-1; i >= 0; i--) if (Boolean.TRUE.equals(tableModel.getValueAt(i,0))) {
+            String id = identityAt(i); hosts.removeIf(h -> h.id().equalsIgnoreCase(id)); reports.remove(id); tableModel.removeRow(i);
         }
     }
 
-    private List<Host> selected() {
-        List<Host> list=new ArrayList<>();
-        for(int i=0;i<model.getRowCount();i++) if(Boolean.TRUE.equals(model.getValueAt(i,0))) {
-            String host=(String)model.getValueAt(i,3);
-            hosts.stream().filter(h->h.host.equals(host)).findFirst().ifPresent(list::add);
-        }
-        return list;
+    private String identityAt(int row) {
+        String host = String.valueOf(tableModel.getValueAt(row,3));
+        String port = String.valueOf(tableModel.getValueAt(row,4));
+        String user = String.valueOf(tableModel.getValueAt(row,5));
+        return host + ":" + port + "@" + user;
     }
 
-    private SSHClient connect(Host h, char[] pwd) throws Exception {
-        SSHClient ssh=new SSHClient();
-        // 使用用户本机 ~/.ssh/known_hosts 校验主机密钥；未知主机将拒绝连接。
-        ssh.loadKnownHosts();
-        ssh.setConnectTimeout(10000);
-        ssh.setTimeout(30000);
-        ssh.connect(h.host,h.port);
-        if(pwd.length>0) ssh.authPassword(h.user,new String(pwd));
-        else ssh.authPublickey(h.user);
-        return ssh;
+    private List<Host> selectedHosts() {
+        List<Host> selected = new ArrayList<>();
+        for (int i=0; i<tableModel.getRowCount(); i++) if (Boolean.TRUE.equals(tableModel.getValueAt(i,0))) {
+            String id = identityAt(i); hosts.stream().filter(h -> h.id().equalsIgnoreCase(id)).findFirst().ifPresent(selected::add);
+        }
+        return selected;
+    }
+
+
+    private TaskManager.Listener sshListener(String operation) {
+        return new TaskManager.Listener() {
+            @Override public void onUpdate(TaskResult r) {
+                append("[" + operation + "/" + r.state() + "] " + r.hostId() + " — " + r.message());
+            }
+            @Override public void onBatchFinished(int total, int completed, int succeeded, int failed, int cancelled) {
+                SwingUtilities.invokeLater(() -> status.setText(operation + "完成：成功 " + succeeded + " / 失败 " + failed + " / 取消 " + cancelled));
+            }
+        };
+    }
+
+    private void startSshOperation(String operation, java.util.function.Function<char[], TaskManager.BatchHandle> submit) {
+        List<Host> targets = selectedHosts();
+        if (targets.isEmpty()) { warn("请先勾选服务器"); return; }
+        char[] pwd = password.getPassword();
+        try {
+            activeBatch = submit.apply(pwd);
+            status.setText(operation + "已提交：" + targets.size() + " 台");
+        } catch (Exception ex) { warn(operation + "启动失败：" + ex.getMessage()); }
+        finally { Arrays.fill(pwd, '\0'); }
     }
 
     private void runCommand() {
-        List<Host> targets=selected(); if(targets.isEmpty()){error("请先勾选服务器");return;}
-        String cmd=command.getText().trim(); if(cmd.isEmpty()) return;
-        char[] pwd=password.getPassword(); setStatus("正在执行：" + targets.size() + " 台服务器");
-        for(Host h:targets) pool.submit(()->{
-            try(SSHClient ssh=connect(h,pwd); Session session=ssh.startSession()) {
-                Session.Command c=session.exec(cmd);
-                c.join(60,TimeUnit.SECONDS);
-                String result=new String(c.getInputStream().readAllBytes(),StandardCharsets.UTF_8);
-                String err=new String(c.getErrorStream().readAllBytes(),StandardCharsets.UTF_8);
-                append("\n[" + h.name + " / " + h.host + "]\n" + result + (err.isBlank()?"":"\n[stderr]\n"+err) + "\n退出码：" + c.getExitStatus());
-                audit("COMMAND", h, "exit=" + c.getExitStatus() + "; command=" + cmd);
-            } catch(Exception ex){append("\n["+h.host+"] 失败："+ex.getMessage());}
-        });
+        JTextArea command = new JTextArea(5, 48); command.setLineWrap(true);
+        JTextField timeout = new JTextField("120", 6);
+        JPanel form = new JPanel(new BorderLayout(6,6)); form.add(new JLabel("远程 Shell 命令（将以当前 SSH 用户执行）"), BorderLayout.NORTH);
+        form.add(new JScrollPane(command), BorderLayout.CENTER);
+        JPanel south = new JPanel(new FlowLayout(FlowLayout.LEFT)); south.add(new JLabel("超时秒数")); south.add(timeout); form.add(south, BorderLayout.SOUTH);
+        if (JOptionPane.showConfirmDialog(null, form, "批量 SSH 命令", JOptionPane.OK_CANCEL_OPTION) != JOptionPane.OK_OPTION) return;
+        try {
+            long seconds = Long.parseLong(timeout.getText().trim());
+            startSshOperation("SSH 命令", pwd -> sshOperations.execute(selectedHosts(), pwd, command.getText(), seconds,
+                    sshListener("SSH"), result -> appendCommandResult(result)));
+        } catch (Exception ex) { warn("参数无效：" + ex.getMessage()); }
     }
 
-    private void inspect() {
-        command.setText("echo '=== HOST ==='; hostname; echo '=== OS ==='; cat /etc/os-release | head -5; echo '=== UPTIME ==='; uptime; echo '=== CPU ==='; nproc; echo '=== MEMORY ==='; free -h; echo '=== DISK ==='; df -hT; echo '=== LOAD ==='; cat /proc/loadavg; echo '=== FAILED SERVICES ==='; systemctl --failed --no-pager; echo '=== PACKAGE MANAGER ==='; (command -v apt-get || command -v dnf || command -v yum || command -v zypper || true); echo '=== FIREWALL ==='; (command -v ufw >/dev/null && ufw status || command -v firewall-cmd >/dev/null && firewall-cmd --state || true)");
-        runCommand();
-    }
-
-    private void toggleMonitor() {
-        if (monitoring.compareAndSet(false, true)) {
-            List<Host> targets = selected();
-            if (targets.isEmpty()) { monitoring.set(false); error("请先勾选服务器"); return; }
-            monitorTask = monitor.scheduleAtFixedRate(() -> {
-                for (Host h : targets) pool.submit(() -> {
-                    char[] pwd = password.getPassword();
-                    try (SSHClient ssh = connect(h, pwd); Session session = ssh.startSession()) {
-                        Session.Command c = session.exec("printf 'HOST='; hostname; printf ' LOAD='; cut -d' ' -f1-3 /proc/loadavg; printf ' MEM='; free -m | awk '/Mem:/ {print $3 "/" $2}'; printf ' ROOTFS='; df -P / | awk 'NR==2 {print $5}'");
-                        c.join(20, TimeUnit.SECONDS);
-                        String result = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
-                        append("[监控 " + h.host + "] " + result);
-                    } catch (Exception ex) { append("[监控异常 " + h.host + "] " + ex.getMessage()); }
-                    finally { Arrays.fill(pwd, '\0'); }
-                });
-            }, 0, 30, TimeUnit.SECONDS);
-            setStatus("实时监控运行中 | 每 30 秒采集一次");
-        } else {
-            monitoring.set(false);
-            if (monitorTask != null) monitorTask.cancel(false);
-            setStatus("实时监控已停止");
-        }
-    }
-
-    private void exportReport() {
-        JFileChooser chooser = new JFileChooser();
-        chooser.setSelectedFile(new File("LinuxOps巡检报告_" + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss")) + ".html"));
-        if (chooser.showSaveDialog(null) != JFileChooser.APPROVE_OPTION) return;
-        String content = output.getText();
-        String escaped = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
-        String html = "<!doctype html><html lang='zh-CN'><meta charset='UTF-8'><title>LinuxOps 巡检报告</title>" +
-                "<style>body{font:14px Arial;background:#101820;color:#e5edf5;padding:28px}h1{color:#54b8ff}pre{white-space:pre-wrap;background:#1b2836;padding:18px;border-radius:8px;line-height:1.5}</style>" +
-                "<h1>LinuxOps 巡检 / 运维记录</h1><p>生成时间：" + LocalDateTime.now() + "</p><pre>" + escaped + "</pre></html>";
-        try { Files.writeString(chooser.getSelectedFile().toPath(), html, StandardCharsets.UTF_8); append("报告已导出：" + chooser.getSelectedFile()); }
-        catch (IOException ex) { error("报告导出失败：" + ex.getMessage()); }
+    private void appendCommandResult(SshOperations.CommandResult r) {
+        append("----- " + r.hostName() + " (" + r.hostId() + ") exit=" + r.exitCode() + " -----");
+        if (!r.stdout().isBlank()) append(r.stdout().stripTrailing());
+        if (!r.stderr().isBlank()) append("[stderr] " + r.stderr().stripTrailing());
     }
 
     private void installPackages() {
-        List<Host> targets = selected();
-        if (targets.isEmpty()) { error("请先勾选服务器"); return; }
-        String packages = JOptionPane.showInputDialog(null, "输入软件包名称，多个包用空格分隔（不支持 shell 参数）", "安装软件包", JOptionPane.QUESTION_MESSAGE);
-        if (packages == null || packages.isBlank()) return;
-        if (!packages.matches("[A-Za-z0-9][A-Za-z0-9+_.:-]*(\\s+[A-Za-z0-9][A-Za-z0-9+_.:-]*)*")) {
-            error("软件包名称格式不正确"); return;
-        }
-        if (JOptionPane.showConfirmDialog(null, "将在 " + targets.size() + " 台服务器上尝试使用 apt-get 或 dnf 安装：\n" + packages + "\n需要远端账户具备 sudo 权限。", "确认批量安装", JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION) return;
-        String remote = "if command -v apt-get >/dev/null 2>&1; then sudo -n apt-get update && sudo -n apt-get install -y -- " + packages + "; elif command -v dnf >/dev/null 2>&1; then sudo -n dnf install -y -- " + packages + "; else echo '不支持的包管理器' >&2; exit 127; fi";
-        executeForHosts(targets, remote, "PACKAGE_INSTALL");
+        JTextField packages = new JTextField("vim curl wget", 32);
+        if (JOptionPane.showConfirmDialog(null, packages, "软件包名称（空格分隔；apt/dnf/yum）", JOptionPane.OK_CANCEL_OPTION) != JOptionPane.OK_OPTION) return;
+        startSshOperation("软件安装", pwd -> sshOperations.installPackages(selectedHosts(), pwd, packages.getText(), sshListener("安装"), this::appendCommandResult));
     }
 
     private void manageService() {
-        List<Host> targets = selected();
-        if (targets.isEmpty()) { error("请先勾选服务器"); return; }
-        String service = JOptionPane.showInputDialog(null, "systemd 服务名称（例如 ssh 或 nginx）", "服务管理", JOptionPane.QUESTION_MESSAGE);
-        if (service == null || service.isBlank()) return;
-        if (!service.matches("[A-Za-z0-9_.@:-]+")) { error("服务名称格式不正确"); return; }
-        String[] actions = {"查看状态", "启动", "停止", "重启"};
-        int choice = JOptionPane.showOptionDialog(null, "选择服务操作：" + service, "服务管理", JOptionPane.DEFAULT_OPTION, JOptionPane.QUESTION_MESSAGE, null, actions, actions[0]);
-        if (choice < 0) return;
-        String verb = new String[]{"status", "start", "stop", "restart"}[choice];
-        if (choice > 0 && JOptionPane.showConfirmDialog(null, "确认对 " + targets.size() + " 台服务器执行 systemctl " + verb + " " + service + "？", "确认服务变更", JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION) return;
-        executeForHosts(targets, "sudo -n systemctl " + verb + " " + service + " --no-pager", "SERVICE_" + verb.toUpperCase(Locale.ROOT));
+        JTextField service = new JTextField("sshd", 18);
+        JComboBox<String> action = new JComboBox<>(new String[]{"status", "start", "stop", "restart"});
+        JPanel form = new JPanel(new GridLayout(0,2,6,6)); form.add(new JLabel("服务名称")); form.add(service); form.add(new JLabel("操作")); form.add(action);
+        if (JOptionPane.showConfirmDialog(null, form, "systemd 服务管理", JOptionPane.OK_CANCEL_OPTION) != JOptionPane.OK_OPTION) return;
+        startSshOperation("systemd", pwd -> sshOperations.manageSystemd(selectedHosts(), pwd, service.getText(), String.valueOf(action.getSelectedItem()), sshListener("systemd"), this::appendCommandResult));
     }
 
-    private void executeForHosts(List<Host> targets, String remoteCommand, String action) {
-        char[] pwd = password.getPassword();
-        setStatus(action + " 执行中 | " + targets.size() + " 台服务器");
-        for (Host h : targets) {
-            char[] taskPwd = pwd.clone();
-            pool.submit(() -> {
-            try (SSHClient ssh = connect(h, taskPwd); Session session = ssh.startSession()) {
-                Session.Command c = session.exec(remoteCommand);
-                c.join(120, TimeUnit.SECONDS);
-                String out = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-                String err = new String(c.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
-                append("[" + action + " " + h.host + "]\n" + out + (err.isBlank() ? "" : "\n[stderr]\n" + err) + "\n退出码：" + c.getExitStatus());
-                audit(action, h, "exit=" + c.getExitStatus());
-            } catch (Exception ex) { append("[" + action + " " + h.host + "] 失败：" + ex.getMessage()); audit(action + "_FAILED", h, ex.toString()); }
-            finally { Arrays.fill(taskPwd, '\0'); }
-            });
-        }
-        Arrays.fill(pwd, '\0');
+    private void rebootHosts() {
+        List<Host> targets = selectedHosts(); if (targets.isEmpty()) { warn("请先勾选服务器"); return; }
+        if (JOptionPane.showConfirmDialog(null, "确定重启选中的 " + targets.size() + " 台服务器？业务连接可能中断。", "确认批量重启", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE) != JOptionPane.YES_OPTION) return;
+        startSshOperation("批量重启", pwd -> sshOperations.reboot(selectedHosts(), pwd, sshListener("重启"), this::appendCommandResult));
     }
 
-    private void audit(String action, Host h, String detail) {
+    private void uploadFile() {
+        JFileChooser chooser = new JFileChooser(); if (chooser.showOpenDialog(null) != JFileChooser.APPROVE_OPTION) return;
+        JTextField remote = new JTextField("/tmp/" + chooser.getSelectedFile().getName(), 32);
+        if (JOptionPane.showConfirmDialog(null, remote, "远程目标路径", JOptionPane.OK_CANCEL_OPTION) != JOptionPane.OK_OPTION) return;
+        startSshOperation("SFTP 上传", pwd -> sshOperations.upload(selectedHosts(), pwd, chooser.getSelectedFile().toPath(), remote.getText(), sshListener("上传"), this::append));
+    }
+
+    private void downloadFile() {
+        JTextField remote = new JTextField("/var/log/syslog", 28);
+        JFileChooser chooser = new JFileChooser(); chooser.setSelectedFile(new java.io.File("downloaded-file"));
+        JPanel form = new JPanel(new BorderLayout(6,6)); form.add(new JLabel("远程文件路径"), BorderLayout.NORTH); form.add(remote, BorderLayout.CENTER);
+        if (JOptionPane.showConfirmDialog(null, form, "SFTP 下载", JOptionPane.OK_CANCEL_OPTION) != JOptionPane.OK_OPTION) return;
+        if (chooser.showSaveDialog(null) != JFileChooser.APPROVE_OPTION) return;
+        startSshOperation("SFTP 下载", pwd -> sshOperations.download(selectedHosts(), pwd, remote.getText(), chooser.getSelectedFile().toPath(), sshListener("下载"), this::append));
+    }
+
+    private void inspect() {
+        List<Host> targets = selectedHosts(); if (targets.isEmpty()) { warn("请先勾选服务器"); return; }
+        char[] pwd = password.getPassword(); status.setText("巡检提交中：" + targets.size() + " 台");
         try {
-            Path dir = Path.of(System.getProperty("user.home"), ".linuxops");
-            Files.createDirectories(dir);
-            String line = LocalDateTime.now() + "\t" + action + "\t" + h.host + "\t" + detail.replace('\n', ' ') + System.lineSeparator();
-            Files.writeString(dir.resolve("audit.log"), line, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
-        } catch (IOException ex) { append("[审计日志写入失败] " + ex.getMessage()); }
+            activeBatch = inspectionService.inspect(targets, pwd, new TaskManager.Listener() {
+                @Override public void onUpdate(TaskResult r) {
+                    SwingUtilities.invokeLater(() -> { append("[" + r.state() + "] " + r.hostId() + " — " + r.message()); status.setText("巡检进度：" + (activeBatch == null ? 0 : activeBatch.completed()) + "/" + targets.size()); });
+                }
+                @Override public void onBatchFinished(int total,int completed,int succeeded,int failed,int cancelled) {
+                    SwingUtilities.invokeLater(() -> status.setText("巡检完成：成功 " + succeeded + " / 失败 " + failed + " / 取消 " + cancelled));
+                }
+            }, report -> {
+                reports.put(report.hostId(), report);
+                SwingUtilities.invokeLater(() -> updateHostStatus(report));
+            });
+        } catch (Exception ex) { warn("无法启动巡检：" + ex.getMessage()); }
+        finally { Arrays.fill(pwd, '\0'); }
     }
 
-    private void upload() {
-        List<Host> targets=selected(); if(targets.isEmpty()){error("请先勾选服务器");return;}
-        JFileChooser fc=new JFileChooser(); if(fc.showOpenDialog(null)!=JFileChooser.APPROVE_OPTION)return;
-        String remote=JOptionPane.showInputDialog("远程目标路径", "/tmp/"+fc.getSelectedFile().getName()); if(remote==null)return;
-        char[] pwd=password.getPassword(); Path local=fc.getSelectedFile().toPath();
-        for(Host h:targets) pool.submit(()->{try(SSHClient ssh=connect(h,pwd);SFTPClient sftp=ssh.newSFTPClient()){
-            sftp.put(local.toString(),remote); append("上传成功："+h.host+" -> "+remote);
-        }catch(Exception e){append("上传失败："+h.host+"："+e.getMessage());}});
+    private void updateHostStatus(InspectionReport report) {
+        for (int i=0;i<tableModel.getRowCount();i++) if (identityAt(i).equalsIgnoreCase(report.hostId()))
+            tableModel.setValueAt(report.overallSeverity().name(),i,6);
+        append("[巡检汇总] " + report.hostName() + "：" + report.overallSeverity() + "，正常 " + report.count(Severity.NORMAL) + "，警告 " + report.count(Severity.WARNING) + "，严重 " + report.count(Severity.CRITICAL));
+        if (report.collectionError()!=null) append("  采集错误：" + report.collectionError());
+        report.metrics().forEach((k,v) -> append("  " + k + " = " + v));
     }
 
-    private void download() {
-        List<Host> targets=selected(); if(targets.isEmpty()){error("请先勾选服务器");return;}
-        String remote=JOptionPane.showInputDialog("远程文件路径"); if(remote==null||remote.isBlank())return;
-        JFileChooser fc=new JFileChooser(); fc.setSelectedFile(new File(Path.of(remote).getFileName().toString()));
-        if(fc.showSaveDialog(null)!=JFileChooser.APPROVE_OPTION)return;
-        char[] pwd=password.getPassword(); Path local=fc.getSelectedFile().toPath();
-        // 多台下载时自动追加主机名，避免覆盖同名文件。
-        for(Host h:targets) pool.submit(()->{Path dest=targets.size()==1?local:local.resolveSibling(stripExt(local.getFileName().toString())+"_"+h.host+ext(local.getFileName().toString()));
-            try(SSHClient ssh=connect(h,pwd);SFTPClient sftp=ssh.newSFTPClient()){sftp.get(remote,dest.toString());append("下载成功："+h.host+" -> "+dest);}
-            catch(Exception e){append("下载失败："+h.host+"："+e.getMessage());}});
+    private void cancelBatch() { if (activeBatch != null) { activeBatch.cancel(); append("已请求取消当前批次；正在运行的 SSH 命令会在检查取消点或超时后退出。"); } }
+
+    private void export(boolean html) {
+        if (reports.isEmpty()) { warn("目前没有巡检报告可导出"); return; }
+        JFileChooser chooser = new JFileChooser(); chooser.setSelectedFile(new java.io.File(html ? "LinuxOps巡检报告.html" : "LinuxOps巡检报告.csv"));
+        if (chooser.showSaveDialog(null) != JFileChooser.APPROVE_OPTION) return;
+        try {
+            List<InspectionReport> snapshot = new ArrayList<>(reports.values());
+            if (html) ReportExporter.exportHtml(snapshot, chooser.getSelectedFile().toPath()); else ReportExporter.exportCsv(snapshot, chooser.getSelectedFile().toPath());
+            append("报告已导出：" + chooser.getSelectedFile().getAbsolutePath());
+        } catch (Exception ex) { warn("报告导出失败：" + ex.getMessage()); }
     }
 
-    private void reboot() {
-        if(JOptionPane.showConfirmDialog(null,"确定对所有已勾选服务器执行 reboot？请确认业务影响。","高风险操作确认",JOptionPane.YES_NO_OPTION)!=JOptionPane.YES_OPTION)return;
-        command.setText("sudo -n reboot");
-        List<Host> targets = selected();
-        audit("REBOOT_REQUESTED", new Host("-", "batch", "multiple", 22, "-"), "targets=" + targets.size());
-        runCommand();
-    }
-    private String ext(String s){int i=s.lastIndexOf('.');return i<0?"":s.substring(i);}
-    private String stripExt(String s){int i=s.lastIndexOf('.');return i<0?s:s.substring(0,i);}
-    private void append(String s){SwingUtilities.invokeLater(()->{output.append(s+"\n");output.setCaretPosition(output.getDocument().getLength());});}
-    private void setStatus(String s){SwingUtilities.invokeLater(()->status.setText(s));}
-    private void error(String s){JOptionPane.showMessageDialog(null,s,"提示",JOptionPane.WARNING_MESSAGE);}
-    private record Host(String group,String name,String host,int port,String user){}
+    private void append(String text) { SwingUtilities.invokeLater(() -> { log.append(text + "\n"); log.setCaretPosition(log.getDocument().getLength()); }); }
+    private void warn(String text) { JOptionPane.showMessageDialog(null,text,"LinuxOps 提示",JOptionPane.WARNING_MESSAGE); }
 }
