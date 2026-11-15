@@ -25,7 +25,18 @@ mvn -B clean package
 java -jar target/linuxops-1.0.0.jar
 ```
 
-Windows 便携应用由 GitHub Actions 的 `.github/workflows/windows-build.yml` 在 Windows runner 上通过 `jpackage --type app-image` 构建。当前工作流产物是 app-image 目录，下载后运行其中的 `LinuxOps.exe`；不是传统安装向导。
+Windows 便携应用由 GitHub Actions 的 `.github/workflows/windows-build.yml` 在 Windows runner 上通过 `jpackage --type app-image` 构建。工作流会将完整运行目录压缩为 `LinuxOps-Windows-x64.zip`。下载并解压后，双击 `LinuxOps.exe` 启动；这是免安装便携包，不是传统安装向导。
+
+### 通过 GitHub Actions 生成 Windows EXE
+
+1. 将本项目目录中的全部内容（特别是 `pom.xml`、`src/` 和 `.github/`）提交到 GitHub 仓库的 `main` 分支根目录。不要只上传 ZIP 文件。
+2. 打开仓库的 **Actions** 页面，选择 **Build LinuxOps Windows EXE**。
+3. 点击 **Run workflow**，等待 Windows 构建任务完成。
+4. 在成功的运行记录页面底部下载 **LinuxOps-Windows-x64** artifact。
+5. 解压后双击 `LinuxOps.exe`。请保留同目录下的 `app/`、`runtime/` 等文件，不要只复制 EXE 单文件。
+
+该包会携带 Java runtime，因此目标 Windows 电脑无需单独安装 Java。构建产物面向 Windows x64。
+
 
 ## 当前源码结构
 
