@@ -40,6 +40,11 @@ public final class Main {
     private TaskManager.BatchHandle activeBatch;
 
     public static void main(String[] args) {
+        Thread.setDefaultUncaughtExceptionHandler((thread, error) -> {
+            SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(null,
+                    "LinuxOps 启动失败：" + error.getClass().getSimpleName() + "\n" + error.getMessage(),
+                    "LinuxOps 启动错误", JOptionPane.ERROR_MESSAGE));
+        });
         SwingUtilities.invokeLater(() -> new Main().show());
     }
 
